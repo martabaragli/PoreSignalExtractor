@@ -35,8 +35,7 @@ python run_extract.py moves \
     --pod5 /path/to/pod5_dir/ \
     --output out_moves.tsv \
     --ref genome.fasta \
-    --threads 16 \
-    --add_median
+    --threads 16
 ```
 
 ### 2. Uncalled4 Reference Eventalign (`unc-ref`)
@@ -88,6 +87,3 @@ The output columns are as follows:
 | `ref_kmer` | Reference sequence context (K-mer) at this position. Will be `N` or `.` if not applicable. |
 | `read_kmer` | Read sequence context (K-mer) at this position. Will be `N` or `.` if not applicable. |
 | `samples_pA` | Comma-separated list of calibrated raw signal samples (in picoamperes). |
-| `median_pA` | *(Optional, `moves` only)* Median value of the extracted signal segment. |
-
-> **Note:** Depending on the specific extraction module used (`moves`, `unc-ref`, `unc-self`, `f5c-self`), some sequence context columns (`ref_kmer`, `read_kmer`) might contain placeholders if the specific alignment engine does not provide that level of sequence information.
