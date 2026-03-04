@@ -2,14 +2,14 @@
 
 PoreSignalExtractor is a high-performance, modular Python pipeline designed to extract raw picoampere (pA) signal from Oxford Nanopore Technologies (ONT) POD5 files and map it to genomic coordinates. 
 
-Handling massive amounts of raw Nanopore data can be highly I/O bound and memory-intensive. This tool elegantly solves the "RAM exhaustion" and "File Descriptor limits" problems by implementing:
+This tool elegantly handles RAM exhaustion and File Descriptor limits problems by implementing:
 * **Fast SQLite Indexing:** Random access to reads across thousands of POD5 files without loading file maps into RAM.
 * **LRU Caching:** Smart management of open POD5 file handles.
 * **Producer-Consumer Multiprocessing:** Highly concurrent extraction architectures optimized for different alignment formats.
 
 ## Supported Alignment Engines
 
-The tool supports 4 different extraction modes, depending on the upstream mapping/basecalling tool used:
+Supports 4 different extraction modes, depending on the upstream mapping/basecalling tool used:
 
 1.  **`moves`**: Uses Dorado's implicit alignment (via `mv` and `ts` tags in the BAM file).
 2.  **`unc-ref`**: Uses `uncalled4 convert --eventalign-out` TSV mapping after ref-based resquiggling.
@@ -18,9 +18,6 @@ The tool supports 4 different extraction modes, depending on the upstream mappin
 
 ---
 
-## Installation & Requirements
-
-Requires **Python 3.8+**.
 
 ## Usage
 
