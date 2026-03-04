@@ -2,14 +2,14 @@
 
 PoreSignalExtractor is a high-performance, modular Python pipeline designed to extract raw picoampere (pA) signal from Oxford Nanopore Technologies (ONT) POD5 files and map it to genomic coordinates. 
 
-This tool handles RAM exhaustion and File Descriptor limits problems by implementing:
+Handling massive amounts of raw Nanopore data can be highly I/O bound and memory-intensive. This tool elegantly solves the "RAM exhaustion" and "File Descriptor limits" problems by implementing:
 * **Fast SQLite Indexing:** Random access to reads across thousands of POD5 files without loading file maps into RAM.
 * **LRU Caching:** Smart management of open POD5 file handles.
 * **Producer-Consumer Multiprocessing:** Highly concurrent extraction architectures optimized for different alignment formats.
 
 ## Supported Alignment Engines
 
-Supports 4 different extraction modes, depending on the upstream mapping/basecalling tool used:
+The tool supports 4 different extraction modes, depending on the upstream mapping/basecalling tool used:
 
 1.  **`moves`**: Uses Dorado's implicit alignment (via `mv` and `ts` tags in the BAM file).
 2.  **`unc-ref`**: Uses `uncalled4 convert --eventalign-out` TSV mapping after ref-based resquiggling.
@@ -35,7 +35,8 @@ python run_extract.py moves \
     --pod5 /path/to/pod5_dir/ \
     --output out_moves.tsv \
     --ref genome.fasta \
-    --threads 16
+    --threads 16 \
+    --add_median
 ```
 
 ### 2. Uncalled4 Reference Eventalign (`unc-ref`)
@@ -87,3 +88,6 @@ The output columns are as follows:
 | `ref_kmer` | Reference sequence context (K-mer) at this position. Will be `N` or `.` if not applicable. |
 | `read_kmer` | Read sequence context (K-mer) at this position. Will be `N` or `.` if not applicable. |
 | `samples_pA` | Comma-separated list of calibrated raw signal samples (in picoamperes). |
+| `median_pA` | *(Optional, `moves` only)* Median value of the extracted signal segment. |
+
+> **Note:** Depending on the specific extraction module used (`moves`, `unc-ref`, `unc-self`, `f5c-self`), some sequence context columns (`ref_kmer`, `read_kmer`) might contain placeholders if the specific alignment engine does not provide that level of sequence information.
