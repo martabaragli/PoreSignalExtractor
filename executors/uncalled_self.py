@@ -15,6 +15,7 @@ import pandas as pd
 from core import config
 from core import base
 from core import signal_math
+from core import bed_handling
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ def worker_extractor(task_queue, result_queue, db_path, bed_target_sites):
             if batch is None:
                 break
             
+            buffer = []
             for read_data in batch:
                 read_id = read_data['id']
                 chrom = read_data['chrom']
@@ -54,7 +56,7 @@ def worker_extractor(task_queue, result_queue, db_path, bed_target_sites):
                     continue
                 pod5_path = res[0]
                 
-                # 2. Recover precise signal map from TSV data
+                # 2. Recover precise signal map from TSV data (Usando la logica originale)
                 c.execute("SELECT query_pos, start_idx, end_idx, kmer FROM signal_map WHERE read_name = ?", (read_id,))
                 rows = c.fetchall()
                 if not rows: 
@@ -66,18 +68,16 @@ def worker_extractor(task_queue, result_queue, db_path, bed_target_sites):
                 # 3. Load full read signal
                 try:
                     with pod5.Reader(pod5_path) as reader:
-                        record = reader.read_one(str(read_id))
-                        if not record: 
-                            continue
-                        full_signal = signal_math.get_picoampere_signal(record)
-                except Exception as e:
+                        selection = next(reader.reads(selection=[read_id]))
+                        full_signal = signal_math.get_picoampere_signal(selection)
+                except Exception:
                     continue
                 
                 # 4. Extract aligned segments
-                buffer = []
+                signal_len = len(full_signal)
                 for q_pos, r_pos in aligned_pairs:
                     # Optional BED filter
-                    if bed_target_sites and (chrom, r_pos) not in bed_target_sites:
+                    if bed_target_sites and not bed_target_sites.contains(chrom, r_pos):
                         continue
                     
                     # In Uncalled4 self-mode, the TSV 'position' maps to the read query position (q_pos)
@@ -85,9 +85,14 @@ def worker_extractor(task_queue, result_queue, db_path, bed_target_sites):
                     if not signal_info: 
                         continue
                     
-                    start_idx, end_idx, read_kmer = signal_info
+                    try:
+                        start_idx = int(signal_info[0])
+                        end_idx = int(signal_info[1])
+                        read_kmer = str(signal_info[2])
+                    except (ValueError, TypeError):
+                        continue
                     
-                    if start_idx < 0 or end_idx > len(full_signal) or start_idx >= end_idx: 
+                    if start_idx < 0 or end_idx > signal_len or start_idx >= end_idx: 
                         continue
                     
                     chunk_pA = full_signal[start_idx:end_idx]
@@ -96,8 +101,8 @@ def worker_extractor(task_queue, result_queue, db_path, bed_target_sites):
                     # format: read_id, contig, position, ref_kmer(.), read_kmer, samples
                     buffer.append(f"{read_id}\t{chrom}\t{r_pos}\t.\t{read_kmer}\t{sig_str}")
                 
-                if buffer:
-                    out_f.write("\n".join(buffer) + "\n")
+            if buffer:
+                out_f.write("\n".join(buffer) + "\n")
     
     conn.close()
     result_queue.put(temp_filename)
@@ -117,6 +122,7 @@ def setup_databases(args, db_path):
     c.execute("PRAGMA synchronous = OFF")
     c.execute("PRAGMA journal_mode = MEMORY")
     
+    # Corretto lo schema per riflettere l'estrazione basata su query_pos
     c.execute("CREATE TABLE signal_map (read_name TEXT, query_pos INTEGER, start_idx INTEGER, end_idx INTEGER, kmer TEXT)")
     c.execute("CREATE TABLE pod5_map (read_name TEXT PRIMARY KEY, path TEXT)")
     
@@ -152,17 +158,7 @@ def run(args):
     db_path = "uncalled_self_map.db"
     
     # 0. BED loading
-    bed_target_sites = None
-    if getattr(args, 'bed', None):
-        logger.info(f"Loading target sites from BED file: {args.bed}")
-        bed_target_sites = set()
-        with open(args.bed) as f:
-            for line in f:
-                if line.startswith("#") or not line.strip(): 
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    bed_target_sites.add((parts[0], int(parts[1])))
+    bed_target_sites = bed_handling.load_bed_target_sites(getattr(args, 'bed', None))
 
     # 1. Setup DB
     setup_databases(args, db_path)
