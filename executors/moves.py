@@ -17,23 +17,25 @@ from core import config
 from core import signal_math
 from core import base
 from core import file_management
+from core import bed_handling
 
 logger = logging.getLogger(__name__)
 
 # --- GLOBAL WORKER STATE ---
-# These variables are initialized once per worker process to avoid passing heavy objects
 worker_cache = None
 worker_db_conn = None
 worker_fasta = None
+worker_bed_sites = None
 
-def init_worker(db_path, ref_file):
+def init_worker(db_path, ref_file, bed_sites):
     """
     Initializes resources for each worker process in the multiprocessing pool.
-    Sets up the POD5 file cache, the SQLite connection, and the FASTA reader.
+    Sets up the POD5 file cache, the SQLite connection, FASTA reader, and BED targets.
     """
-    global worker_cache, worker_db_conn, worker_fasta
+    global worker_cache, worker_db_conn, worker_fasta, worker_bed_sites
     
     worker_cache = file_management.Pod5FileCache()
+    worker_bed_sites = bed_sites
     
     # Open SQLite in read-only mode for thread-safe concurrent access
     db_uri = f"file:{db_path}?mode=ro"
@@ -47,7 +49,7 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
     Processes a specific genomic region (or unmapped reads), extracting the raw signal 
     segments based on the basecaller's 'mv' (moves) tags.
     """
-    global worker_cache, worker_db_conn, worker_fasta
+    global worker_cache, worker_db_conn, worker_fasta, worker_bed_sites
     
     chrom, start_pos, end_pos, task_id = region_task
     temp_filename = os.path.join(output_dir, f"temp_{task_id}.tsv")
@@ -59,19 +61,16 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
         logger.error(f"Task {task_id}: Error opening BAM {bam_path} -> {e}")
         return None
 
-    # Determine which reads to fetch based on the task definition
     if chrom == "UNMAPPED":
         try:
             iterator = bam.fetch(until_eof=True)
             iterator = (r for r in iterator if r.is_unmapped)
         except Exception as e:
-            logger.error(f"Task {task_id}: Error fetching UNMAPPED reads -> {e}")
             return None
     else:
         try:
             iterator = bam.fetch(chrom, start_pos, end_pos)
         except Exception as e:
-            logger.error(f"Task {task_id}: Error fetching region {chrom}:{start_pos}-{end_pos} -> {e}")
             return None
 
     reads_written = 0
@@ -81,11 +80,10 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
         for read in iterator:
             read_id = read.query_name
 
-            # Skip reads without move tables
             if not read.has_tag('mv'): 
                 continue
             
-            # 1. Get POD5 path from SQLite DB
+            # 1. Get POD5 path
             c.execute("SELECT path FROM pod5_map WHERE read_name = ?", (read_id,))
             res = c.fetchone()
             if not res: 
@@ -108,8 +106,7 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
                     if record is None: 
                         continue
                     full_signal = signal_math.get_picoampere_signal(record)
-                except Exception as e:
-                    logger.debug(f"Read {read_id} not found or error in POD5: {e}")
+                except Exception:
                     continue
 
                 ts_shift = read.get_tag('ts') if read.has_tag('ts') else 0
@@ -122,7 +119,6 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
 
                 base_to_move_idx = valid_moves_indices[:seq_len]
                 
-                # Setup Read-to-Reference mapping
                 if not read.is_unmapped:
                     aligned_pairs = read.get_aligned_pairs(matches_only=False)
                     read_to_ref_map = {q: r for q, r in aligned_pairs if q is not None}
@@ -130,9 +126,19 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
                     read_to_ref_map = {}
 
                 read_seq = read.query_sequence
+                chrom_out = read.reference_name if not read.is_unmapped else "UNMAPPED"
 
-                # Iterate through bases (skipping borders to allow full k-mer extraction)
+                # Iterate through bases
                 for base_idx in range(kmer_offset, seq_len - kmer_offset):
+                    ref_pos = read_to_ref_map.get(base_idx)
+                    
+                    # --- FILTRO BED ---
+                    if worker_bed_sites is not None:
+                        # Se è unmapped o la posizione non è nel BED, salta questa base
+                        if ref_pos is None or not worker_bed_sites.contains(chrom_out, ref_pos):
+                            continue
+                    # ------------------
+                    
                     start_move_idx = base_to_move_idx[base_idx]
                     end_move_idx = base_to_move_idx[base_idx + 1] if base_idx + 1 < seq_len else len(moves_array)
                     
@@ -143,31 +149,24 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
                         continue
                         
                     segment_signal = full_signal[start_signal_idx:end_signal_idx]
-                    
-                    # Extract read k-mer
                     read_kmer = read_seq[base_idx - kmer_offset : base_idx + kmer_offset + 1]
                     
-                    # Extract reference k-mer if mapped
-                    ref_pos = read_to_ref_map.get(base_idx)
-                    
                     if ref_pos is not None and worker_fasta is not None:
-                        ref_kmer = signal_math.get_kmer_from_fasta(worker_fasta, read.reference_name, ref_pos)
-                        chrom_out = read.reference_name
+                        ref_kmer = signal_math.get_kmer_from_fasta(worker_fasta, chrom_out, ref_pos)
                         pos_out = ref_pos
                     else:
                         ref_kmer = "N" * config.KMER_LENGTH
-                        chrom_out = "NA"
                         pos_out = "NA"
 
                     signal_str = ",".join(f"{x:.1f}" for x in segment_signal)
                     
+                    # Formato a 6 colonne standard
                     row_data = [
                         read_id, 
-                        str(base_idx),
-                        read_kmer, 
                         chrom_out, 
                         str(pos_out), 
                         ref_kmer, 
+                        read_kmer,
                         signal_str
                     ]
                         
@@ -175,12 +174,10 @@ def process_region(region_task, bam_path, output_dir, include_unmapped):
                     reads_written += 1
                     
             except Exception as e:
-                logger.debug(f"Error processing read {read_id}: {e}")
                 continue
 
     bam.close()
     
-    # Periodic garbage collection to keep memory profile low
     if task_id % 50 == 0:
         gc.collect()
 
@@ -191,6 +188,9 @@ def run(args):
     Main entry point for the 'moves' extraction subcommand.
     """
     db_path = "moves_map.db"
+    
+    # 0. Load BED target sites
+    bed_target_sites = bed_handling.load_bed_target_sites(getattr(args, 'bed', None))
     
     # 1. Indexing
     base.index_pod5_files(args.pod5, db_path)
@@ -203,7 +203,7 @@ def run(args):
     ref_lens = {chrom: bam.get_reference_length(chrom) for chrom in bam.references}
     bam.close()
 
-    # 2. Task Generation
+    # 2. Task Generation (Chuncking del genoma per parallelizzazione su interi cromosomi)
     tasks = []
     pid_counter = 0
     
@@ -232,7 +232,7 @@ def run(args):
     with Pool(
         processes=args.threads, 
         initializer=init_worker, 
-        initargs=(db_path, args.ref), 
+        initargs=(db_path, getattr(args, 'fasta', None), bed_target_sites), 
         maxtasksperchild=config.MAX_TASKS_PER_CHILD
     ) as pool:
         for res in pool.imap_unordered(func, tasks, chunksize=1):
@@ -241,7 +241,8 @@ def run(args):
 
     # 4. Merging
     logger.info("Merging temporary files into final output...")
-    header = ['read_id', 'read_base_index', 'read_kmer', 'contig', 'position', 'ref_kmer', 'samples_pA']
+    # Header a 6 colonne standardizzato!
+    header = ['read_id', 'contig', 'position', 'ref_kmer', 'read_kmer', 'samples_pA']
     
     with open(args.output, 'w') as final_out:
         final_out.write('\t'.join(header) + '\n')
